@@ -11,7 +11,7 @@ export async function POST(req: Request) {
     }
 
     const phrase = quoteRaw.replace(/\s+/g, " ").slice(0, 240);
-    const q = `("${phrase}") (trump OR "donald trump")`;
+    const q = `"${safe}" trump`;
 
     const gdeltUrl =
       "https://api.gdeltproject.org/api/v2/doc/doc" +
@@ -19,7 +19,20 @@ export async function POST(req: Request) {
       `&mode=artlist&format=json&sort=dateasc&maxrecords=10`;
 
     const gRes = await fetch(gdeltUrl);
-    const gJson = await gRes.json();
+    const gRes = await fetch(gdeltUrl, { headers: { "User-Agent": "trump-spy-poc/1.0" } });
+    const text = await gRes.text();
+
+    let gJson: any = null;
+    try {
+      gJson = JSON.parse(text);
+    } catch {
+      return NextResponse.json(
+        { ok: false, error: `GDELT returned non-JSON: ${text.slice(0, 200)}` },
+        { status: 502 }
+      );
+    }
+    
+    
 
     const earliest = gJson.articles?.[0];
     if (!earliest) {
@@ -105,3 +118,4 @@ function pctChange(a: number, b: number) {
   return ((b - a) / a) * 100;
 
 }
+
