@@ -4,6 +4,12 @@ export const runtime = "nodejs";
 
 const GDELT_PROXY_BASE = "https://nameless-paper-1be6.chrisdmuggie.workers.dev";
 
+// GDELT asks for 1 request / 5 seconds. We'll enforce 6s to be safe.
+const MIN_GDELT_INTERVAL_MS = 6000;
+
+// Best-effort per-instance throttle (Vercel serverless may run multiple instances)
+let lastGdeltAt = 0;
+
 type SeriesPoint = { date: string; close: number };
 type GdeltArticle = {
   url?: string;
@@ -54,38 +60,43 @@ async function analyze(input: string): Promise<any> {
       .slice(0, 240);
 
     const safe = normalized.replace(/"/g, '\\"');
-
-    // Simple query (no parentheses)
     const query = `"${safe}" trump`;
 
     const gdeltUrl =
       "https://api.gdeltproject.org/api/v2/doc/doc" +
       `?query=${encodeURIComponent(query)}` +
-      `&mode=artlist&format=json&sort=dateasc&maxrecords=50`;
+      `&mode=artlist&format=json&sort=dateasc&maxrecords=20`;
 
-    // Call GDELT THROUGH Cloudflare Worker proxy
-    const proxied = `${GDELT_PROXY_BASE}/?url=${encodeURIComponent(gdeltUrl)}`;
-
-    let gdeltStatus: number | null = null;
-    let gdeltText = "";
-    try {
-      const gdeltRes = await fetch(proxied);
-      gdeltStatus = gdeltRes.status;
-      gdeltText = await gdeltRes.text();
-    } catch (e: any) {
+    // --- Throttle (best-effort)
+    const now = Date.now();
+    const waitMs = lastGdeltAt ? Math.max(0, MIN_GDELT_INTERVAL_MS - (now - lastGdeltAt)) : 0;
+    if (waitMs > 0) {
       return {
         ok: false,
-        httpStatus: 502,
-        error: "fetch failed (GDELT via proxy)",
+        httpStatus: 429,
+        error: `Rate limited to protect GDELT. Wait ${Math.ceil(waitMs / 1000)}s and try again.`,
+        debug: { rule: "min 1 request / 6s", waitMs },
+      };
+    }
+    lastGdeltAt = now;
+
+    // Proxy request + ask worker/CDN to cache briefly to reduce repeated hits
+    const proxied = `${GDELT_PROXY_BASE}/?url=${encodeURIComponent(gdeltUrl)}&cache=1`;
+
+    const gdeltRes = await fetch(proxied);
+    const gdeltStatus = gdeltRes.status;
+    const gdeltText = await gdeltRes.text();
+
+    // Handle 429 plain-text from GDELT (via proxy)
+    if (gdeltStatus === 429) {
+      return {
+        ok: false,
+        httpStatus: 429,
+        error: "GDELT rate limited this request. Try again in ~5–10 seconds.",
         debug: {
-          input,
-          normalized,
-          query,
+          gdeltStatus,
           proxied,
-          where: "gdelt_fetch_proxy",
-          message: e?.message,
-          name: e?.name,
-          cause: String(e?.cause ?? ""),
+          preview: gdeltText.slice(0, 200),
         },
       };
     }
@@ -98,11 +109,7 @@ async function analyze(input: string): Promise<any> {
         ok: false,
         httpStatus: 502,
         error: `GDELT (via proxy) returned non-JSON (status ${gdeltStatus}).`,
-        debug: {
-          gdeltStatus,
-          proxied,
-          preview: gdeltText.slice(0, 200),
-        },
+        debug: { gdeltStatus, proxied, preview: gdeltText.slice(0, 200) },
       };
     }
 
@@ -131,27 +138,9 @@ async function analyze(input: string): Promise<any> {
 
     // SPY daily history from Stooq
     const stooqUrl = "https://stooq.com/q/d/l/?s=spy.us&i=d";
-
-    let stooqStatus: number | null = null;
-    let csvText = "";
-    try {
-      const stooqRes = await fetch(stooqUrl);
-      stooqStatus = stooqRes.status;
-      csvText = await stooqRes.text();
-    } catch (e: any) {
-      return {
-        ok: false,
-        httpStatus: 502,
-        error: "fetch failed (STOOQ)",
-        debug: {
-          url: stooqUrl,
-          where: "stooq_fetch",
-          message: e?.message,
-          name: e?.name,
-          cause: String(e?.cause ?? ""),
-        },
-      };
-    }
+    const stooqRes = await fetch(stooqUrl);
+    const stooqStatus = stooqRes.status;
+    const csvText = await stooqRes.text();
 
     if (csvText.trim().startsWith("<")) {
       return {
@@ -164,23 +153,13 @@ async function analyze(input: string): Promise<any> {
 
     const seriesAll = parseStooqDaily(csvText);
     if (seriesAll.length < 30) {
-      return {
-        ok: false,
-        httpStatus: 500,
-        error: "Stooq returned too little data.",
-        debug: { stooqStatus, seriesLen: seriesAll.length },
-      };
+      return { ok: false, httpStatus: 500, error: "Stooq returned too little data.", debug: { stooqStatus, seriesLen: seriesAll.length } };
     }
 
     const eventDate = earliestIso.slice(0, 10);
     const eventIdx = findIndexOnOrAfter(seriesAll, eventDate);
     if (eventIdx < 1) {
-      return {
-        ok: false,
-        httpStatus: 500,
-        error: "Could not align event date to SPY trading data.",
-        debug: { earliestIso, eventDate, seriesLen: seriesAll.length },
-      };
+      return { ok: false, httpStatus: 500, error: "Could not align event date to SPY trading data.", debug: { earliestIso, eventDate } };
     }
 
     const prev = seriesAll[eventIdx - 1];
@@ -189,7 +168,6 @@ async function analyze(input: string): Promise<any> {
 
     const start = Math.max(0, eventIdx - 10);
     const end = Math.min(seriesAll.length, eventIdx + 11);
-    const windowSeries = seriesAll.slice(start, end);
 
     return {
       ok: true,
@@ -206,7 +184,7 @@ async function analyze(input: string): Promise<any> {
         retPrevToEventPct: pctChange(prev.close, evt.close),
         retEventToNextPct: next ? pctChange(evt.close, next.close) : undefined,
       },
-      series: windowSeries,
+      series: seriesAll.slice(start, end),
       debug: { gdeltStatus, stooqStatus },
     };
   } catch (e: any) {
