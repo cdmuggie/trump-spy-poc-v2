@@ -4,10 +4,8 @@ export const runtime = "nodejs";
 
 const GDELT_PROXY_BASE = "https://nameless-paper-1be6.chrisdmuggie.workers.dev";
 
-// GDELT asks for 1 request / 5 seconds. We'll enforce 6s to be safe.
+// Best-effort throttle (per warm instance)
 const MIN_GDELT_INTERVAL_MS = 6000;
-
-// Best-effort per-instance throttle (Vercel serverless may run multiple instances)
 let lastGdeltAt = 0;
 
 type SeriesPoint = { date: string; close: number };
@@ -67,7 +65,7 @@ async function analyze(input: string): Promise<any> {
       `?query=${encodeURIComponent(query)}` +
       `&mode=artlist&format=json&sort=dateasc&maxrecords=20`;
 
-    // --- Throttle (best-effort)
+    // Best-effort throttle
     const now = Date.now();
     const waitMs = lastGdeltAt ? Math.max(0, MIN_GDELT_INTERVAL_MS - (now - lastGdeltAt)) : 0;
     if (waitMs > 0) {
@@ -80,24 +78,19 @@ async function analyze(input: string): Promise<any> {
     }
     lastGdeltAt = now;
 
-    // Proxy request + ask worker/CDN to cache briefly to reduce repeated hits
-    const proxied = `${GDELT_PROXY_BASE}/?url=${encodeURIComponent(gdeltUrl)}&cache=1`;
+    // Call through Cloudflare Worker proxy (Worker also caches briefly)
+    const proxied = `${GDELT_PROXY_BASE}/?url=${encodeURIComponent(gdeltUrl)}`;
 
     const gdeltRes = await fetch(proxied);
     const gdeltStatus = gdeltRes.status;
     const gdeltText = await gdeltRes.text();
 
-    // Handle 429 plain-text from GDELT (via proxy)
     if (gdeltStatus === 429) {
       return {
         ok: false,
         httpStatus: 429,
         error: "GDELT rate limited this request. Try again in ~5–10 seconds.",
-        debug: {
-          gdeltStatus,
-          proxied,
-          preview: gdeltText.slice(0, 200),
-        },
+        debug: { gdeltStatus, proxied, preview: gdeltText.slice(0, 200) },
       };
     }
 
@@ -174,11 +167,7 @@ async function analyze(input: string): Promise<any> {
       input,
       normalized,
       query,
-      earliest: {
-        datetime: earliestIso,
-        title: earliest.title ?? "",
-        url: earliest.url ?? "",
-      },
+      earliest: { datetime: earliestIso, title: earliest.title ?? "", url: earliest.url ?? "" },
       spy: {
         eventTradingDate: evt.date,
         retPrevToEventPct: pctChange(prev.close, evt.close),
@@ -196,8 +185,25 @@ function getBestDate(a: any): string | null {
   return a?.seendate || a?.seenDate || a?.datetime || a?.date || null;
 }
 
+/**
+ * Supports:
+ *  - YYYYMMDDThhmmssZ   (example: 20251127T013000Z)
+ *  - YYYYMMDDhhmmss
+ *  - Any Date.parse()-compatible string
+ */
 function toIso(dt: string | null): string | null {
   if (!dt) return null;
+
+  if (/^\d{8}T\d{6}Z$/.test(dt)) {
+    const y = dt.slice(0, 4);
+    const m = dt.slice(4, 6);
+    const d = dt.slice(6, 8);
+    const hh = dt.slice(9, 11);
+    const mm = dt.slice(11, 13);
+    const ss = dt.slice(13, 15);
+    return `${y}-${m}-${d}T${hh}:${mm}:${ss}Z`;
+  }
+
   if (/^\d{14}$/.test(dt)) {
     const y = dt.slice(0, 4);
     const m = dt.slice(4, 6);
@@ -207,6 +213,7 @@ function toIso(dt: string | null): string | null {
     const ss = dt.slice(12, 14);
     return `${y}-${m}-${d}T${hh}:${mm}:${ss}Z`;
   }
+
   const t = Date.parse(dt);
   return isNaN(t) ? null : new Date(t).toISOString();
 }
