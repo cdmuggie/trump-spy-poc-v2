@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
+const GDELT_PROXY_BASE = "https://nameless-paper-1be6.chrisdmuggie.workers.dev";
+
 type SeriesPoint = { date: string; close: number };
 type GdeltArticle = {
   url?: string;
@@ -34,6 +36,7 @@ export async function POST(req: Request) {
     if (!quoteRaw) {
       return NextResponse.json({ ok: false, error: "Missing quote", httpStatus: 400 }, { status: 400 });
     }
+
     const result = await analyze(quoteRaw);
     const status = result.ok ? 200 : result.httpStatus ?? 500;
     return NextResponse.json(result, { status, headers: { "Cache-Control": "no-store" } });
@@ -51,6 +54,8 @@ async function analyze(input: string): Promise<any> {
       .slice(0, 240);
 
     const safe = normalized.replace(/"/g, '\\"');
+
+    // Simple query (no parentheses)
     const query = `"${safe}" trump`;
 
     const gdeltUrl =
@@ -58,24 +63,26 @@ async function analyze(input: string): Promise<any> {
       `?query=${encodeURIComponent(query)}` +
       `&mode=artlist&format=json&sort=dateasc&maxrecords=50`;
 
-    // --- Fetch GDELT with explicit error capture
+    // Call GDELT THROUGH Cloudflare Worker proxy
+    const proxied = `${GDELT_PROXY_BASE}/?url=${encodeURIComponent(gdeltUrl)}`;
+
     let gdeltStatus: number | null = null;
     let gdeltText = "";
     try {
-      const gdeltRes = await fetch(gdeltUrl, { headers: { "User-Agent": "trump-spy-poc/1.0" } });
+      const gdeltRes = await fetch(proxied);
       gdeltStatus = gdeltRes.status;
       gdeltText = await gdeltRes.text();
     } catch (e: any) {
       return {
         ok: false,
         httpStatus: 502,
-        error: "fetch failed (GDELT)",
+        error: "fetch failed (GDELT via proxy)",
         debug: {
           input,
           normalized,
           query,
-          url: gdeltUrl,
-          where: "gdelt_fetch",
+          proxied,
+          where: "gdelt_fetch_proxy",
           message: e?.message,
           name: e?.name,
           cause: String(e?.cause ?? ""),
@@ -90,10 +97,10 @@ async function analyze(input: string): Promise<any> {
       return {
         ok: false,
         httpStatus: 502,
-        error: `GDELT returned non-JSON (status ${gdeltStatus}).`,
+        error: `GDELT (via proxy) returned non-JSON (status ${gdeltStatus}).`,
         debug: {
-          url: gdeltUrl,
           gdeltStatus,
+          proxied,
           preview: gdeltText.slice(0, 200),
         },
       };
@@ -105,13 +112,14 @@ async function analyze(input: string): Promise<any> {
         ok: false,
         httpStatus: 404,
         error: "No matching articles found in GDELT for that phrase.",
-        debug: { query, gdeltStatus, url: gdeltUrl },
+        debug: { query, gdeltStatus, proxied },
       };
     }
 
     const earliest = articles[0];
     const earliestRaw = getBestDate(earliest);
     const earliestIso = toIso(earliestRaw);
+
     if (!earliestIso) {
       return {
         ok: false,
@@ -121,9 +129,9 @@ async function analyze(input: string): Promise<any> {
       };
     }
 
+    // SPY daily history from Stooq
     const stooqUrl = "https://stooq.com/q/d/l/?s=spy.us&i=d";
 
-    // --- Fetch Stooq with explicit error capture
     let stooqStatus: number | null = null;
     let csvText = "";
     try {
@@ -156,13 +164,23 @@ async function analyze(input: string): Promise<any> {
 
     const seriesAll = parseStooqDaily(csvText);
     if (seriesAll.length < 30) {
-      return { ok: false, httpStatus: 500, error: "Stooq returned too little data.", debug: { stooqStatus, seriesLen: seriesAll.length } };
+      return {
+        ok: false,
+        httpStatus: 500,
+        error: "Stooq returned too little data.",
+        debug: { stooqStatus, seriesLen: seriesAll.length },
+      };
     }
 
     const eventDate = earliestIso.slice(0, 10);
     const eventIdx = findIndexOnOrAfter(seriesAll, eventDate);
     if (eventIdx < 1) {
-      return { ok: false, httpStatus: 500, error: "Could not align event date to SPY trading data.", debug: { earliestIso, eventDate } };
+      return {
+        ok: false,
+        httpStatus: 500,
+        error: "Could not align event date to SPY trading data.",
+        debug: { earliestIso, eventDate, seriesLen: seriesAll.length },
+      };
     }
 
     const prev = seriesAll[eventIdx - 1];
@@ -171,16 +189,24 @@ async function analyze(input: string): Promise<any> {
 
     const start = Math.max(0, eventIdx - 10);
     const end = Math.min(seriesAll.length, eventIdx + 11);
+    const windowSeries = seriesAll.slice(start, end);
 
     return {
       ok: true,
-      earliest: { datetime: earliestIso, title: earliest.title ?? "", url: earliest.url ?? "" },
+      input,
+      normalized,
+      query,
+      earliest: {
+        datetime: earliestIso,
+        title: earliest.title ?? "",
+        url: earliest.url ?? "",
+      },
       spy: {
         eventTradingDate: evt.date,
         retPrevToEventPct: pctChange(prev.close, evt.close),
         retEventToNextPct: next ? pctChange(evt.close, next.close) : undefined,
       },
-      series: seriesAll.slice(start, end),
+      series: windowSeries,
       debug: { gdeltStatus, stooqStatus },
     };
   } catch (e: any) {
