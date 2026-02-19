@@ -103,4 +103,5 @@ function findIndexOnOrAfter(series: any[], date: string) {
 
 function pctChange(a: number, b: number) {
   return ((b - a) / a) * 100;
+
 }
